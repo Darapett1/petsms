@@ -1,9 +1,7 @@
 """
-TempSMS Scraper — runs via GitHub Actions cron job.
-Sources: sms-online.co, quackr.io (both work reliably from GitHub Actions IPs).
-Writes numbers + messages to Firebase Firestore.
-
-pip install requests beautifulsoup4 firebase-admin
+TempSMS Scraper — 5-server architecture, 20 numbers per server.
+Each server scrapes from its assigned source and stores with server tag.
+Source names are never exposed; they map to Server 1-5 on the frontend.
 """
 
 import os, re, time, json, random, hashlib, logging
@@ -17,10 +15,7 @@ from firebase_admin import credentials, firestore
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-SOURCES = [
-    "https://sms-online.co",
-    "https://quackr.io",
-]
+MAX_PER_SOURCE = 20
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -113,8 +108,8 @@ def fetch_html(url: str, referer: str = None, timeout=20):
         return None
 
 
-def doc_id(number: str):
-    return re.sub(r"[^\w]", "_", number)
+def doc_id(number: str, server: int):
+    return f"s{server}_{re.sub(r'[^\w]', '_', number)}"
 
 
 def normalize_number(raw: str):
@@ -124,100 +119,7 @@ def normalize_number(raw: str):
     return cleaned
 
 
-# ── sms-online.co parsers ─────────────────────────────────────────────────
-
-def parse_smsonline_numbers(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    nums = []
-    seen = set()
-    for a in soup.find_all("a", href=True):
-        m = re.search(r"/receive-free-sms/(\d+)", a["href"])
-        if not m:
-            continue
-        raw = m.group(1)
-        if raw in seen:
-            continue
-        seen.add(raw)
-        number = normalize_number(raw)
-        code, name, flag = detect_country(number)
-        nums.append({
-            "number": number,
-            "countryCode": code,
-            "country": name,
-            "countryFlag": flag,
-            "isActive": True,
-            "_base": "https://sms-online.co",
-            "_path": f"/receive-free-sms/{raw}",
-        })
-    return nums
-
-
-def parse_smsonline_messages(html: str, number: str):
-    soup = BeautifulSoup(html, "html.parser")
-    msgs = []
-    for item in soup.select("div.list-item"):
-        sender_el = item.select_one(".list-item-title")
-        body_el = item.select_one(".list-item-content")
-        if not body_el:
-            continue
-        sender = sender_el.get_text(strip=True) if sender_el else "Unknown"
-        body = body_el.get_text(strip=True)
-        if not body:
-            continue
-        _add_msg(msgs, number, sender, body, "")
-    return msgs
-
-
-# ── quackr.io parsers ─────────────────────────────────────────────────────
-
-def parse_quackr_numbers(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    nums = []
-    seen = set()
-    for a in soup.find_all("a", href=True):
-        m = re.search(r"/temporary-numbers/[\w-]+/(\d+)", a["href"])
-        if not m:
-            continue
-        raw = m.group(1)
-        if raw in seen:
-            continue
-        seen.add(raw)
-        number = normalize_number(raw)
-        code, name, flag = detect_country(number)
-        path_m = re.search(r"(/temporary-numbers/[^\s\"']+)", a["href"])
-        nums.append({
-            "number": number,
-            "countryCode": code,
-            "country": name,
-            "countryFlag": flag,
-            "isActive": True,
-            "_base": "https://quackr.io",
-            "_path": path_m.group(1) if path_m else f"/temporary-numbers/{raw}",
-        })
-    return nums
-
-
-def parse_quackr_messages(html: str, number: str):
-    soup = BeautifulSoup(html, "html.parser")
-    msgs = []
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "")
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                body = item.get("text") or item.get("description") or ""
-                author = item.get("author", {})
-                sender = author.get("name", "Unknown") if isinstance(author, dict) else "Unknown"
-                if body:
-                    _add_msg(msgs, number, sender, body, "")
-        except Exception:
-            pass
-    return msgs
-
-
-# ── Shared helpers ────────────────────────────────────────────────────────
-
-def _add_msg(msgs, number, sender, body, time_txt):
+def _add_msg(msgs, number, sender, body):
     received_at = datetime.now(timezone.utc).isoformat()
     msg_id = hashlib.md5(f"{number}|{sender}|{body[:60]}".encode()).hexdigest()
     msgs.append({
@@ -230,33 +132,284 @@ def _add_msg(msgs, number, sender, body, time_txt):
     })
 
 
-PARSERS = {
-    "https://sms-online.co": {
-        "list_url": "https://sms-online.co/receive-free-sms",
-        "parse_nums": parse_smsonline_numbers,
-        "parse_msgs": parse_smsonline_messages,
-    },
-    "https://quackr.io": {
-        "list_url": "https://quackr.io/temporary-numbers",
-        "parse_nums": parse_quackr_numbers,
-        "parse_msgs": parse_quackr_messages,
-    },
-}
+# ── Server 1: primary free-SMS source ────────────────────────────────────
 
-
-def scrape_numbers():
-    for base in SOURCES:
-        p = PARSERS[base]
-        log.info(f"Trying source: {base}")
-        html = fetch_html(p["list_url"])
-        if not html:
+def parse_s1_numbers(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    nums, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"/receive-free-sms/(\d+)", a["href"])
+        if not m or m.group(1) in seen:
             continue
-        nums = p["parse_nums"](html)
-        if nums:
-            log.info(f"Got {len(nums)} numbers from {base}")
-            return nums
-        log.warning(f"No numbers parsed from {base}")
-    return []
+        seen.add(m.group(1))
+        raw = m.group(1)
+        number = normalize_number(raw)
+        code, name, flag = detect_country(number)
+        nums.append({
+            "number": number, "countryCode": code, "country": name, "countryFlag": flag,
+            "isActive": True, "_base": "https://sms-online.co",
+            "_path": f"/receive-free-sms/{raw}",
+        })
+        if len(nums) >= MAX_PER_SOURCE:
+            break
+    return nums
+
+
+def parse_s1_messages(html: str, number: str):
+    soup = BeautifulSoup(html, "html.parser")
+    msgs = []
+    for item in soup.select("div.list-item"):
+        sender_el = item.select_one(".list-item-title")
+        body_el = item.select_one(".list-item-content")
+        if not body_el:
+            continue
+        sender = sender_el.get_text(strip=True) if sender_el else "Unknown"
+        body = body_el.get_text(strip=True)
+        if body:
+            _add_msg(msgs, number, sender, body)
+    return msgs
+
+
+# ── Server 2: secondary free-SMS source ──────────────────────────────────
+
+def parse_s2_numbers(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    nums, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"/temporary-numbers/[\w-]+/(\d+)", a["href"])
+        if not m or m.group(1) in seen:
+            continue
+        seen.add(m.group(1))
+        raw = m.group(1)
+        number = normalize_number(raw)
+        code, name, flag = detect_country(number)
+        path_m = re.search(r"(/temporary-numbers/[^\s\"']+)", a["href"])
+        nums.append({
+            "number": number, "countryCode": code, "country": name, "countryFlag": flag,
+            "isActive": True, "_base": "https://quackr.io",
+            "_path": path_m.group(1) if path_m else f"/temporary-numbers/{raw}",
+        })
+        if len(nums) >= MAX_PER_SOURCE:
+            break
+    return nums
+
+
+def parse_s2_messages(html: str, number: str):
+    soup = BeautifulSoup(html, "html.parser")
+    msgs = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                body = item.get("text") or item.get("description") or ""
+                author = item.get("author", {})
+                sender = author.get("name", "Unknown") if isinstance(author, dict) else "Unknown"
+                if body:
+                    _add_msg(msgs, number, sender, body)
+        except Exception:
+            pass
+    # Fallback: scan visible message divs
+    if not msgs:
+        for div in soup.select(".message-text, .sms-message, .message-body, [class*=message]"):
+            body = div.get_text(strip=True)
+            if body and len(body) > 4:
+                _add_msg(msgs, number, "Unknown", body)
+    return msgs
+
+
+# ── Server 3: receivesms.cc ───────────────────────────────────────────────
+
+def parse_s3_numbers(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    nums, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        # Common patterns: /number/+XXXX  /phone/+XXXX  /sms/+XXXX
+        m = re.search(r"/(?:number|phone|sms|receive)/\+?(\d{7,15})", href)
+        if m:
+            raw, path = m.group(1), href
+        else:
+            text = re.sub(r"\s+", "", a.get_text())
+            m2 = re.search(r"\+?(\d{8,15})", text)
+            if m2 and href not in ("/", "#", "") and len(href) > 3:
+                raw, path = m2.group(1), href
+            else:
+                continue
+        if raw in seen:
+            continue
+        seen.add(raw)
+        number = normalize_number(raw)
+        code, name, flag = detect_country(number)
+        nums.append({
+            "number": number, "countryCode": code, "country": name, "countryFlag": flag,
+            "isActive": True, "_base": "https://receivesms.cc",
+            "_path": path if path.startswith("/") else f"/{path}",
+        })
+        if len(nums) >= MAX_PER_SOURCE:
+            break
+    return nums
+
+
+def parse_s3_messages(html: str, number: str):
+    soup = BeautifulSoup(html, "html.parser")
+    msgs = []
+    for row in soup.select("table tr"):
+        cells = row.find_all("td")
+        if len(cells) >= 2:
+            sender = cells[0].get_text(strip=True) or "Unknown"
+            body = cells[1].get_text(strip=True)
+            if body and len(body) > 2:
+                _add_msg(msgs, number, sender, body)
+    if not msgs:
+        for div in soup.select(".sms-message, .message-body, .sms-text, .msg-body, .inbox-item, [class*=message]"):
+            body = div.get_text(strip=True)
+            if body and len(body) > 4:
+                _add_msg(msgs, number, "Unknown", body)
+    return msgs
+
+
+# ── Server 4: receive-sms-free.cc ─────────────────────────────────────────
+
+def parse_s4_numbers(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    nums, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        m = re.search(r"/\+?(\d{7,15})(?:/|$)", href)
+        if m:
+            raw, path = m.group(1), href
+        else:
+            text = re.sub(r"\s+", "", a.get_text())
+            m2 = re.search(r"\+?(\d{8,15})", text)
+            if m2 and href not in ("/", "#", "") and len(href) > 3:
+                raw, path = m2.group(1), href
+            else:
+                continue
+        if raw in seen:
+            continue
+        seen.add(raw)
+        number = normalize_number(raw)
+        code, name, flag = detect_country(number)
+        nums.append({
+            "number": number, "countryCode": code, "country": name, "countryFlag": flag,
+            "isActive": True, "_base": "https://receive-sms-free.cc",
+            "_path": path if path.startswith("/") else f"/{path}",
+        })
+        if len(nums) >= MAX_PER_SOURCE:
+            break
+    return nums
+
+
+def parse_s4_messages(html: str, number: str):
+    soup = BeautifulSoup(html, "html.parser")
+    msgs = []
+    for row in soup.select("table tr, .sms-list li, .receive-item"):
+        cells = row.find_all("td")
+        if len(cells) >= 2:
+            sender = cells[0].get_text(strip=True) or "Unknown"
+            body = cells[-1].get_text(strip=True)
+            if body and len(body) > 2:
+                _add_msg(msgs, number, sender, body)
+    if not msgs:
+        for div in soup.select(".message, .sms, .text-msg, [class*=message], [class*=sms]"):
+            body = div.get_text(strip=True)
+            if body and len(body) > 4:
+                _add_msg(msgs, number, "Unknown", body)
+    return msgs
+
+
+# ── Server 5: smstome.com ─────────────────────────────────────────────────
+
+def parse_s5_numbers(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    nums, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        m = re.search(r"/phone-number/\+?(\d{7,15})", href)
+        if m:
+            raw, path = m.group(1), href
+        else:
+            text = re.sub(r"\s+", "", a.get_text())
+            m2 = re.search(r"\+?(\d{8,15})", text)
+            if m2 and href not in ("/", "#", "") and "/phone" in href:
+                raw, path = m2.group(1), href
+            else:
+                continue
+        if raw in seen:
+            continue
+        seen.add(raw)
+        number = normalize_number(raw)
+        code, name, flag = detect_country(number)
+        nums.append({
+            "number": number, "countryCode": code, "country": name, "countryFlag": flag,
+            "isActive": True, "_base": "https://smstome.com",
+            "_path": path if path.startswith("/") else f"/{path}",
+        })
+        if len(nums) >= MAX_PER_SOURCE:
+            break
+    return nums
+
+
+def parse_s5_messages(html: str, number: str):
+    soup = BeautifulSoup(html, "html.parser")
+    msgs = []
+    for div in soup.select(".card-body, .message-row, .sms-item, [class*=message], [class*=sms]"):
+        body = div.get_text(strip=True)
+        if body and len(body) > 4 and "no messages" not in body.lower():
+            _add_msg(msgs, number, "Unknown", body)
+    if not msgs:
+        for row in soup.select("table tr"):
+            cells = row.find_all("td")
+            if len(cells) >= 2:
+                sender = cells[0].get_text(strip=True) or "Unknown"
+                body = cells[-1].get_text(strip=True)
+                if body and len(body) > 2:
+                    _add_msg(msgs, number, sender, body)
+    return msgs
+
+
+# ── Source registry ───────────────────────────────────────────────────────
+
+SOURCES = [
+    {
+        "server": 1,
+        "base": "https://sms-online.co",
+        "list_url": "https://sms-online.co/receive-free-sms",
+        "parse_nums": parse_s1_numbers,
+        "parse_msgs": parse_s1_messages,
+    },
+    {
+        "server": 2,
+        "base": "https://quackr.io",
+        "list_url": "https://quackr.io/temporary-numbers",
+        "parse_nums": parse_s2_numbers,
+        "parse_msgs": parse_s2_messages,
+    },
+    {
+        "server": 3,
+        "base": "https://receivesms.cc",
+        "list_url": "https://receivesms.cc/",
+        "parse_nums": parse_s3_numbers,
+        "parse_msgs": parse_s3_messages,
+    },
+    {
+        "server": 4,
+        "base": "https://receive-sms-free.cc",
+        "list_url": "https://receive-sms-free.cc/",
+        "parse_nums": parse_s4_numbers,
+        "parse_msgs": parse_s4_messages,
+    },
+    {
+        "server": 5,
+        "base": "https://smstome.com",
+        "list_url": "https://smstome.com/",
+        "parse_nums": parse_s5_numbers,
+        "parse_msgs": parse_s5_messages,
+    },
+]
+
+BASE_TO_SOURCE = {s["base"]: s for s in SOURCES}
 
 
 def scrape_messages_for(num_doc: dict):
@@ -266,14 +419,16 @@ def scrape_messages_for(num_doc: dict):
     if not base or not path:
         return []
     url = base + path
-    time.sleep(random.uniform(2, 5))
-    html = fetch_html(url, referer=PARSERS.get(base, {}).get("list_url", base))
+    time.sleep(random.uniform(1.5, 3.5))
+    src = BASE_TO_SOURCE.get(base, {})
+    html = fetch_html(url, referer=src.get("list_url", base))
     if not html:
         return []
-    parse_msgs = PARSERS.get(base, {}).get("parse_msgs")
-    if parse_msgs:
-        return parse_msgs(html, number)
-    return []
+    try:
+        return src["parse_msgs"](html, number)
+    except Exception as e:
+        log.warning(f"Message parse error [{url}]: {e}")
+        return []
 
 
 # ── Firebase ──────────────────────────────────────────────────────────────
@@ -288,40 +443,70 @@ def init_firebase():
 
 
 def run_scrape():
-    log.info("=== TempSMS Scraper ===")
+    log.info("=== TempSMS Scraper (5-server mode, %d numbers/server) ===", MAX_PER_SOURCE)
     db = init_firebase()
 
-    numbers = scrape_numbers()
-    if not numbers:
-        log.error("No numbers found from any source. Aborting.")
+    all_numbers = []
+    server_stats = {i: {"numbers": 0, "messages": 0} for i in range(1, 6)}
+
+    for src in SOURCES:
+        snum = src["server"]
+        log.info(f"[Server {snum}] Fetching listing page...")
+        html = fetch_html(src["list_url"])
+        if not html:
+            log.warning(f"[Server {snum}] Failed to fetch listing")
+            continue
+        try:
+            nums = src["parse_nums"](html)
+        except Exception as e:
+            log.warning(f"[Server {snum}] Parse error: {e}")
+            nums = []
+
+        if not nums:
+            log.warning(f"[Server {snum}] No numbers found")
+            continue
+
+        log.info(f"[Server {snum}] Found {len(nums)} numbers")
+        for n in nums:
+            n["server"] = snum
+        all_numbers.extend(nums)
+        server_stats[snum]["numbers"] = len(nums)
+
+    if not all_numbers:
+        log.error("No numbers from any server. Aborting.")
         return
 
     batch = db.batch()
     batch_ops = 0
     total_msgs = 0
 
-    for num_doc in numbers:
+    for num_doc in all_numbers:
+        snum = num_doc["server"]
         msgs = scrape_messages_for(num_doc)
-        total_msgs += len(msgs)
-        did = doc_id(num_doc["number"])
+        # Enforce newest-first order
+        msgs_sorted = sorted(msgs, key=lambda x: x["receivedAt"], reverse=True)
+        total_msgs += len(msgs_sorted)
+        server_stats[snum]["messages"] += len(msgs_sorted)
+
+        did = doc_id(num_doc["number"], snum)
         num_ref = db.collection("numbers").document(did)
 
         clean = {k: v for k, v in num_doc.items() if not k.startswith("_")}
         clean.update({
-            "messageCount": len(msgs),
-            "lastActivity": msgs[0]["receivedAt"] if msgs else None,
+            "messageCount": len(msgs_sorted),
+            "lastActivity": msgs_sorted[0]["receivedAt"] if msgs_sorted else None,
             "updatedAt": datetime.now(timezone.utc).isoformat(),
         })
         batch.set(num_ref, clean, merge=True)
         batch_ops += 1
 
-        for msg in msgs:
+        for msg in msgs_sorted:
             msg_ref = num_ref.collection("messages").document(msg["id"])
             batch.set(msg_ref, msg, merge=True)
             batch_ops += 1
             if batch_ops >= 400:
                 batch.commit()
-                log.info("Batch committed (400 ops)")
+                log.info("Batch committed (400 ops limit)")
                 batch = db.batch()
                 batch_ops = 0
 
@@ -329,12 +514,16 @@ def run_scrape():
         batch.commit()
 
     db.collection("meta").document("stats").set({
-        "totalNumbers": len(numbers),
+        "totalNumbers": len(all_numbers),
         "totalMessages": total_msgs,
         "lastScrapeAt": datetime.now(timezone.utc).isoformat(),
         "isLive": True,
+        "serverStats": {str(k): v for k, v in server_stats.items()},
     })
-    log.info(f"Done — {len(numbers)} numbers, {total_msgs} messages")
+
+    for snum, stats in server_stats.items():
+        log.info(f"[Server {snum}] {stats['numbers']} numbers, {stats['messages']} messages")
+    log.info(f"=== Done: {len(all_numbers)} numbers, {total_msgs} messages total ===")
 
 
 if __name__ == "__main__":
