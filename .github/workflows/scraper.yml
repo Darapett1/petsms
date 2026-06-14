@@ -2,9 +2,8 @@ name: TempSMS Scraper
 
   on:
     schedule:
-      # Runs every 10 minutes
       - cron: '*/10 * * * *'
-    workflow_dispatch:  # Allow manual trigger
+    workflow_dispatch:
 
   jobs:
     scrape:
@@ -22,12 +21,10 @@ name: TempSMS Scraper
             cache: 'pip'
 
         - name: Install dependencies
-          run: |
-            pip install -r requirements.txt
+          run: pip install -r requirements.txt
 
         - name: Run scraper
           env:
             FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          run: |
-            python scripts/scraper.py
+          run: python scripts/scraper.py
   
