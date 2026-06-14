@@ -1,38 +1,37 @@
 name: TempSMS Scraper
 
-  on:
-    schedule:
-      - cron: '*/10 * * * *'
-    workflow_dispatch:
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
 
-  jobs:
-    scrape:
-      runs-on: ubuntu-latest
-      timeout-minutes: 8
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
-      steps:
-        - name: Checkout repository
-          uses: actions/checkout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-        - name: Set up Python
-          uses: actions/setup-python@v5
-          with:
-            python-version: '3.12'
-            cache: 'pip'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
 
-        - name: Install dependencies
-          run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-        - name: Deploy Firestore rules
-          env:
-            FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          run: |
-            echo "$FIREBASE_SERVICE_ACCOUNT" > /tmp/sa.json
-            export GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json
-            npx --yes firebase-tools@latest deploy --only firestore:rules --project petsms34 --non-interactive
+      - name: Deploy Firestore rules
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          echo "$FIREBASE_SERVICE_ACCOUNT" > /tmp/sa.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json
+          npx --yes firebase-tools@latest deploy --only firestore:rules --project petsms34 --non-interactive
 
-        - name: Run scraper
-          env:
-            FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          run: python scripts/scraper.py
-  
+      - name: Run scraper
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: python scripts/scraper.py
