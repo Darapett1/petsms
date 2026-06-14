@@ -68,9 +68,36 @@
 
 <!-- ═══════════════════════ DASHBOARD ═══════════════════════ -->
 <div id="view-dashboard" class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  <div class="mb-6">
+  <div class="mb-5">
     <h1 class="text-2xl font-bold text-slate-900 mb-1">Available Numbers</h1>
-    <p class="text-slate-500 text-sm">Pick a number to see all verification codes it has received.</p>
+    <p class="text-slate-500 text-sm">Filter by country or search, then click a number to view its inbox.</p>
+  </div>
+
+  <!-- ── Filter bar ──────────────────────────────────────────────────── -->
+  <div class="bg-white border border-slate-200 rounded-2xl p-4 mb-5 shadow-sm space-y-3">
+    <!-- Search input -->
+    <div class="relative">
+      <svg class="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+      </svg>
+      <input id="search-input" type="text" placeholder="Search by number or country..."
+             oninput="applyFilter()"
+             class="w-full pl-10 pr-4 py-2.5 text-sm border border-slate-200 rounded-xl bg-slate-50 text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-400 focus:border-transparent transition" />
+      <button id="search-clear" onclick="clearSearch()" class="hidden absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600">
+        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <!-- Country chips -->
+    <div id="country-chips" class="flex flex-wrap gap-2">
+      <button onclick="filterCountry(null)" id="chip-all"
+              class="chip-btn active-chip flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border transition-all">
+        All countries
+      </button>
+    </div>
+    <!-- Results count -->
+    <div id="filter-meta" class="hidden text-xs text-slate-400 font-medium pt-0.5">
+      Showing <span id="filter-count" class="font-bold text-slate-600"></span> numbers
+    </div>
   </div>
 
   <div id="numbers-skeleton" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
@@ -88,6 +115,14 @@
     </div>
     <h3 class="text-lg font-semibold text-slate-700 mb-1">Syncing numbers...</h3>
     <p class="text-slate-400 text-sm max-w-xs mx-auto">The scraper is fetching numbers. Run it manually in GitHub Actions to populate data instantly.</p>
+  </div>
+
+  <div id="no-filter-results" class="hidden text-center py-16">
+    <div class="w-14 h-14 rounded-2xl bg-slate-100 flex items-center justify-center mx-auto mb-3">
+      <svg class="w-7 h-7 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2a1 1 0 01-.293.707L13 13.414V19a1 1 0 01-.553.894l-4 2A1 1 0 017 21v-7.586L3.293 6.707A1 1 0 013 6V4z"/></svg>
+    </div>
+    <p class="text-slate-500 text-sm font-semibold">No numbers match your filter</p>
+    <button onclick="clearSearch(); filterCountry(null)" class="mt-3 text-xs text-violet-600 hover:text-violet-800 font-semibold underline underline-offset-2">Clear filters</button>
   </div>
 </div>
 
@@ -241,35 +276,135 @@
     } catch (e) { console.warn("Stats:", e); }
   }
 
+  // ── Filter state ─────────────────────────────────────────────────────
+  let allNumbers       = [];
+  let activeCountry    = null;   // null = All
+  let activeSearch     = "";
+
+  function buildChips() {
+    const counts = {};
+    for (const n of allNumbers) {
+      const key = n.country || "Unknown";
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    // Sort by count desc
+    const sorted = Object.entries(counts).sort((a,b) => b[1]-a[1]);
+
+    const chipsEl = document.getElementById("country-chips");
+    // Keep "All" chip, replace the rest
+    chipsEl.innerHTML = `
+      <button onclick="filterCountry(null)" id="chip-all"
+              class="chip-btn flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border transition-all">
+        All countries
+        <span class="bg-slate-100 text-slate-600 rounded-full px-1.5 py-0.5 text-[10px] font-bold">${allNumbers.length}</span>
+      </button>
+      ${sorted.map(([country, count]) => {
+        const num = allNumbers.find(n => n.country === country);
+        const flag = num?.countryFlag || "🌐";
+        return `<button onclick="filterCountry('${country.replace(/'/g,"\\'")}'))"
+                        id="chip-${country.replace(/[^a-zA-Z]/g,'_')}"
+                        class="chip-btn flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border transition-all">
+                  <span>${flag}</span>
+                  <span>${esc(country)}</span>
+                  <span class="bg-slate-100 text-slate-600 rounded-full px-1.5 py-0.5 text-[10px] font-bold">${count}</span>
+                </button>`;
+      }).join("")}`;
+
+    refreshChipStyles();
+  }
+
+  function refreshChipStyles() {
+    document.querySelectorAll(".chip-btn").forEach(btn => {
+      btn.classList.remove("bg-violet-600","text-white","border-violet-600","bg-white","text-slate-700","border-slate-200");
+      const isAll     = btn.id === "chip-all" && activeCountry === null;
+      const isCountry = btn.textContent.trim().startsWith(
+        allNumbers.find(n => n.country === activeCountry)?.countryFlag ?? "__NONE__"
+      );
+      if (isAll || (activeCountry !== null && btn.onclick?.toString().includes(`'${activeCountry}'`))) {
+        btn.classList.add("bg-violet-600","text-white","border-violet-600");
+      } else {
+        btn.classList.add("bg-white","text-slate-700","border-slate-200","hover:border-violet-300");
+      }
+    });
+  }
+
+  window.filterCountry = function(country) {
+    activeCountry = country;
+    refreshChipStyles();
+    applyFilter();
+  };
+
+  window.applyFilter = function() {
+    activeSearch = (document.getElementById("search-input").value || "").toLowerCase().trim();
+    // Show/hide clear button
+    document.getElementById("search-clear").classList.toggle("hidden", !activeSearch);
+
+    let filtered = allNumbers;
+    if (activeCountry) filtered = filtered.filter(n => n.country === activeCountry);
+    if (activeSearch)  filtered = filtered.filter(n =>
+      n.number?.toLowerCase().includes(activeSearch) ||
+      n.country?.toLowerCase().includes(activeSearch) ||
+      n.countryCode?.toLowerCase().includes(activeSearch)
+    );
+
+    renderGrid(filtered);
+  };
+
+  window.clearSearch = function() {
+    document.getElementById("search-input").value = "";
+    document.getElementById("search-clear").classList.add("hidden");
+    activeSearch = "";
+    applyFilter();
+  };
+
+  function renderGrid(nums) {
+    const grid = document.getElementById("numbers-grid");
+    hide("no-filter-results");
+
+    if (!nums.length) {
+      grid.innerHTML = "";
+      hide("numbers-grid");
+      show("no-filter-results");
+      hide("filter-meta");
+      return;
+    }
+
+    grid.innerHTML = nums.map(n => `
+      <div class="bg-white border border-slate-200 rounded-2xl p-5 card-hover cursor-pointer fade-in shadow-sm"
+           onclick="window._openInbox('${n.id}')">
+        <div class="flex items-start justify-between mb-3">
+          <span class="text-3xl leading-none">${esc(n.countryFlag) || '🌐'}</span>
+          <span class="text-xs font-semibold text-emerald-600 bg-emerald-50 border border-emerald-100 px-2 py-0.5 rounded-full">Active</span>
+        </div>
+        <div class="mono text-sm font-bold text-slate-800 mb-0.5 break-all">${esc(n.number)}</div>
+        <div class="text-xs text-slate-400 font-medium mb-4">${esc(n.country) || 'Unknown'}</div>
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-slate-400">${n.messageCount || 0} msg${n.messageCount !== 1 ? 's' : ''}</span>
+          <span class="bg-violet-600 text-white text-xs font-bold px-3 py-1.5 rounded-lg">View Inbox</span>
+        </div>
+      </div>`).join("");
+
+    show("numbers-grid");
+
+    const isFiltered = activeCountry || activeSearch;
+    document.getElementById("filter-meta").classList.toggle("hidden", !isFiltered);
+    document.getElementById("filter-count").textContent = nums.length;
+  }
+
   // ── Dashboard ────────────────────────────────────────────────────────
   async function loadNumbers() {
-    show("numbers-skeleton"); hide("numbers-grid"); hide("numbers-empty");
+    show("numbers-skeleton"); hide("numbers-grid"); hide("numbers-empty"); hide("no-filter-results");
     try {
       const snap = await getDocs(query(collection(db, "numbers"), orderBy("messageCount","desc"), limit(60)));
-      const nums = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      allNumbers = snap.docs.map(d => ({ id: d.id, ...d.data() }));
       hide("numbers-skeleton");
-      if (!nums.length) { show("numbers-empty"); return; }
+      if (!allNumbers.length) { show("numbers-empty"); return; }
 
-      const grid = document.getElementById("numbers-grid");
-      grid.innerHTML = nums.map(n => `
-        <div class="bg-white border border-slate-200 rounded-2xl p-5 card-hover cursor-pointer fade-in shadow-sm"
-             onclick="window._openInbox('${n.id}')">
-          <div class="flex items-start justify-between mb-3">
-            <span class="text-3xl leading-none">${esc(n.countryFlag) || '🌐'}</span>
-            <span class="text-xs font-semibold text-emerald-600 bg-emerald-50 border border-emerald-100 px-2 py-0.5 rounded-full">Active</span>
-          </div>
-          <div class="mono text-sm font-bold text-slate-800 mb-0.5 break-all">${esc(n.number)}</div>
-          <div class="text-xs text-slate-400 font-medium mb-4">${esc(n.country) || 'Unknown'}</div>
-          <div class="flex items-center justify-between">
-            <span class="text-xs text-slate-400">${n.messageCount || 0} message${n.messageCount !== 1 ? 's' : ''}</span>
-            <span class="bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition-colors">View Inbox</span>
-          </div>
-        </div>`).join("");
-
-      show("numbers-grid");
+      buildChips();
+      renderGrid(allNumbers);
 
       window._openInbox = (id) => {
-        const num = nums.find(n => n.id === id);
+        const num = allNumbers.find(n => n.id === id);
         if (num) showInbox(num);
       };
     } catch (e) {
